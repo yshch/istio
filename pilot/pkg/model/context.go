@@ -918,7 +918,23 @@ func (node *Proxy) FuzzValidate() bool {
 }
 
 func (node *Proxy) EnableHBONEListen() bool {
-	return node.IsAmbient() || (features.EnableSidecarHBONEListening && bool(node.Metadata.EnableHBONE))
+	if node == nil {
+		return false
+	}
+	return node.IsAmbient() || (features.EnableSidecarHBONEListening && node.Metadata != nil && bool(node.Metadata.EnableHBONE))
+}
+
+func (node *Proxy) EnableHBONESend() bool {
+	if node == nil {
+		return false
+	}
+	return node.IsAmbient() || (features.EnableHBONESend && node.Metadata != nil && !bool(node.Metadata.DisableHBONESend))
+}
+
+// EnableSidecarWaypointRouting reports whether this sidecar should delegate
+// eligible service-addressed traffic to service waypoints.
+func (node *Proxy) EnableSidecarWaypointRouting() bool {
+	return node != nil && node.Type == SidecarProxy && features.EnableSidecarWaypointRouting && node.EnableHBONESend()
 }
 
 func (node *Proxy) SetWorkloadEntry(name string, create bool) {

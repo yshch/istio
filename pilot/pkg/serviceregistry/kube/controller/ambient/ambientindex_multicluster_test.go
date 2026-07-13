@@ -326,6 +326,130 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 	}
 }
 
+func TestMulticlusterAmbientIndex_ServicesWithWaypointForCluster(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	s := newAmbientTestServer(t, testC, testNW, "")
+	s.AddSecret("s1", "remote-cluster")
+	remoteClients := krt.NewCollection(s.remoteClusters, func(_ krt.HandlerContext, c *multicluster.Cluster) **remoteAmbientClients {
+		return ptr.Of(&remoteAmbientClients{
+			clusterID: c.ID,
+			ambientclients: &ambientclients{
+				pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, c.Client),
+				sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, c.Client),
+				ns:    clienttest.NewWriter[*corev1.Namespace](t, c.Client),
+				grc:   clienttest.NewWriter[*k8sbeta.Gateway](t, c.Client),
+				gwcls: clienttest.NewWriter[*k8sbeta.GatewayClass](t, c.Client),
+			},
+		})
+	})
+	assert.EventuallyEqual(t, func() int { return len(remoteClients.List()) }, 1)
+	remote := remoteClients.List()[0]
+
+	remote.ns.Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: systemNS}})
+	remote.ns.Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNS}})
+	remote.gwcls.Create(&k8sbeta.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: constants.WaypointGatewayClassName},
+		Spec:       k8sv1.GatewayClassSpec{ControllerName: constants.ManagedGatewayMeshController},
+	})
+
+	// Use different waypoint names so selecting the merged config-cluster
+	// ServiceInfo is observable.
+	s.addWaypointForClient(t, "10.0.0.10", "local-wp", constants.ServiceTraffic, true, s.grc)
+	s.addServiceForClient(t, "local-wp", nil, nil, []int32{15008}, map[string]string{"app": "local-wp"}, "10.0.0.10", s.sc)
+	s.addServiceForClient(t, "svc", map[string]string{
+		label.IoIstioUseWaypoint.Name: "local-wp",
+		"istio.io/global":             "true",
+	}, nil, []int32{80}, map[string]string{"app": "svc"}, "10.0.0.1", s.sc)
+
+	s.addWaypointForClient(t, "10.1.0.10", "remote-wp", constants.ServiceTraffic, true, remote.grc)
+	s.addServiceForClient(t, "remote-wp", map[string]string{"istio.io/global": "true"}, nil, []int32{15008}, map[string]string{
+		"app":                     "remote-wp",
+		label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel,
+	}, "10.1.0.10", remote.sc)
+	s.addServiceForClient(t, "svc", map[string]string{
+		label.IoIstioUseWaypoint.Name: "remote-wp",
+		"istio.io/global":             "true",
+	}, nil, []int32{80}, map[string]string{"app": "svc"}, "10.1.0.1", remote.sc)
+
+	serviceKey := s.svcXdsName("svc")
+	// Native multicluster lookup uses flattened, precomputed indexes rather than
+	// enumerating the requested cluster's nested service collection on every xDS
+	// generation. Verify both the destination-service and waypoint-address paths.
+	assert.EventuallyEqual(t, func() string {
+		got := s.services.ClusteredByKey.Lookup(clusterServiceKey{
+			ClusterID:  remote.clusterID,
+			ServiceKey: serviceKey,
+		})
+		if len(got) != 1 {
+			return fmt.Sprint(got)
+		}
+		return got[0].Service.Service.Hostname
+	}, s.hostnameForService("svc"))
+	assert.EventuallyEqual(t, func() string {
+		got := s.services.ClusteredByAddress.Lookup(clusterNetworkAddress{
+			ClusterID: remote.clusterID,
+			Address:   networkAddress{ip: "10.1.0.10"},
+		})
+		if len(got) != 1 {
+			return fmt.Sprint(got)
+		}
+		return got[0].Service.Service.Hostname
+	}, s.hostnameForService("remote-wp"))
+
+	assert.EventuallyEqual(t, func() string {
+		got := s.ServicesWithWaypoint(serviceKey, remote.clusterID)
+		if len(got) != 1 {
+			return fmt.Sprint(got)
+		}
+		return got[0].WaypointHostname
+	}, s.hostnameForService("remote-wp"))
+	assert.EventuallyEqual(t, func() string {
+		got := s.ServicesWithWaypoint(serviceKey, s.clusterID)
+		if len(got) != 1 {
+			return fmt.Sprint(got)
+		}
+		return got[0].WaypointHostname
+	}, s.hostnameForService("local-wp"))
+
+	// A local waypoint change is visible to both the merged and clustered
+	// collections, but only the clustered shim should emit the destination-service
+	// update. MatchOrFail also verifies that no duplicate event is emitted.
+	s.clearEvents()
+	s.addPodsForClient(t, "10.0.0.11", "local-wp-pod", "sa1", map[string]string{
+		"app":                     "local-wp",
+		label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel,
+	}, nil, true, corev1.PodRunning, s.pc)
+	s.assertEvent(t, s.hostnameForService("svc"))
+
+	// Metadata-only local changes have the same single-owner behavior.
+	s.labelPodForClient(t, "local-wp-pod", testNS, map[string]string{
+		"app":                     "local-wp",
+		"version":                 "v2",
+		label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel,
+	}, s.pc)
+	s.assertEvent(t, s.hostnameForService("svc"))
+
+	// The merged service follows the config-cluster binding. A remote waypoint
+	// replica change must nevertheless invalidate the destination service for
+	// remote sidecars.
+	s.clearEvents()
+	s.addPodsForClient(t, "10.1.0.11", "remote-wp-pod", "sa1", map[string]string{
+		"app":                     "remote-wp",
+		label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel,
+	}, nil, true, corev1.PodRunning, remote.pc)
+	// Managed waypoint workloads do not produce a standalone address event, but
+	// must produce the destination-service EDS event.
+	s.assertEvent(t, s.hostnameForService("svc"))
+
+	// Metadata-only changes must also propagate without a replica-count change.
+	s.labelPodForClient(t, "remote-wp-pod", testNS, map[string]string{
+		"app":                     "remote-wp",
+		"version":                 "v2",
+		label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel,
+	}, remote.pc)
+	s.assertEvent(t, s.hostnameForService("svc"))
+}
+
 func TestMulticlusterAmbientIndex_ServicesForWaypoint(t *testing.T) {
 	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
 	wpKey := model.WaypointKey{

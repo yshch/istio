@@ -23,6 +23,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/xds/endpoints"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/util/hash"
 )
@@ -59,6 +60,7 @@ type clusterCache struct {
 	envoyFilterKeys []string
 	peerAuthVersion string   // identifies the versions of all peer authentications
 	serviceAccounts []string // contains all the service accounts associated with the service
+	waypoint        bool     // whether sidecar service traffic is delegated to a waypoint
 }
 
 func (t *clusterCache) Type() string {
@@ -128,6 +130,8 @@ func (t *clusterCache) Key() any {
 	h.Write(Separator)
 
 	h.WriteString(strconv.FormatBool(t.preserveHTTP1HeaderCase))
+	h.Write(Separator)
+	h.WriteString(strconv.FormatBool(t.waypoint))
 	h.Write(Separator)
 
 	if t.endpointBuilder != nil {
@@ -211,5 +215,6 @@ func buildClusterKey(service *model.Service, port *model.Port, cb *ClusterBuilde
 		peerAuthVersion:         cb.req.Push.AuthnPolicies.GetVersion(),
 		serviceAccounts:         cb.req.Push.ServiceAccounts(service.Hostname, service.Attributes.Namespace),
 		endpointBuilder:         eb,
+		waypoint:                proxy.EnableSidecarWaypointRouting() && service.GetAddressForProxy(proxy) != constants.UnspecifiedIP && len(cb.req.Push.ServicesWithWaypoint(service.Key(), proxy.GetClusterID())) > 0,
 	}
 }

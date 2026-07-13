@@ -93,6 +93,15 @@ type servicesCollection struct {
 	ByAddress                krt.Index[networkAddress, model.ServiceInfo]
 	ByOwningWaypointHostname krt.Index[NamespaceHostname, model.ServiceInfo]
 	ByOwningWaypointIP       krt.Index[networkAddress, model.ServiceInfo]
+
+	// Native ambient multicluster deliberately merges replicated services using
+	// the config-cluster ServiceInfo. These indexes retain each cluster's
+	// unmerged representation for sidecar waypoint lookup without scanning every
+	// service in the requested cluster.
+	Clustered          krt.Collection[clusteredServiceInfo]
+	ClusteredByCluster krt.Index[cluster.ID, clusteredServiceInfo]
+	ClusteredByKey     krt.Index[clusterServiceKey, clusteredServiceInfo]
+	ClusteredByAddress krt.Index[clusterNetworkAddress, clusteredServiceInfo]
 }
 
 // index maintains an index of ambient WorkloadInfo objects by various keys.
@@ -489,9 +498,11 @@ func New(options Options) Index {
 		PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
 	), false)
 
-	if features.EnableIngressWaypointRouting {
+	if features.EnableIngressWaypointRouting || features.EnableSidecarWaypointRouting {
 		RegisterEdsShim(
 			a.XDSUpdater,
+			features.EnableSidecarWaypointRouting,
+			false,
 			Workloads,
 			NamespacesInfo,
 			WorkloadServiceIndex,

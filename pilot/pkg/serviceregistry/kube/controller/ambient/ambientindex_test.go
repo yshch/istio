@@ -79,6 +79,7 @@ func init() {
 	features.EnableAmbientWaypoints = true
 	features.EnableAmbient = true
 	features.EnableIngressWaypointRouting = true
+	features.EnableSidecarWaypointRouting = true
 }
 
 var validTrafficTypes = sets.New(constants.ServiceTraffic, constants.WorkloadTraffic, constants.AllTraffic, constants.NoTraffic)
@@ -401,7 +402,13 @@ func TestAmbientIndex_ServiceAttachedWaypoints(t *testing.T) {
 			s.assertEvent(t, s.podXdsName("pod1"), s.svcXdsName("svc1"))
 
 			s.labelService(t, "svc1", testNS, map[string]string{label.IoIstioUseWaypoint.Name: "test-wp"})
-			s.assertEvent(t, s.svcXdsName("svc1"))
+			// The address update changes the ambient service, while the EDS
+			// update refreshes sidecar clusters that now resolve this service
+			// through the waypoint.
+			s.fx.MatchOrFail(t,
+				xdsfake.Event{Type: "xds", ID: s.svcXdsName("svc1")},
+				xdsfake.Event{Type: "xds full", ID: s.hostnameForService("svc1")},
+			)
 			s.assertNoEvent(t)
 
 			// We should now see the waypoint service IP when we look up the annotated svc

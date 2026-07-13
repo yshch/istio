@@ -1192,7 +1192,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			Services: exampleService,
 		})
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{}, 8080, map[host.Name]types.NamespacedName{},
+			[]config.Config{}, 8080, map[host.Name]types.NamespacedName{}, nil,
 		)
 		g.Expect(vhosts[0].Routes[0].Action.(*envoyroute.Route_Route).Route.HashPolicy).NotTo(BeNil())
 	})
@@ -1212,7 +1212,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			Services: exampleService,
 		})
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{}, 8080, map[host.Name]types.NamespacedName{},
+			[]config.Config{}, 8080, map[host.Name]types.NamespacedName{}, nil,
 		)
 
 		hashPolicy := &envoyroute.RouteAction_HashPolicy{
@@ -1253,7 +1253,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 				virtualServiceWithNestedWildcardHost,
 				virtualServiceWithGoogleWildcardHost,
 			}, 8080,
-			wildcardIndex,
+			wildcardIndex, nil,
 		)
 		log.Printf("%#v", vhosts)
 		// *.example.org, *.hello.example.org. The *.google.com VS is missing from virtualHosts because
@@ -1263,6 +1263,92 @@ func TestBuildHTTPRoutes(t *testing.T) {
 			g.Expect(vhost.Services).To(HaveLen(1))
 			g.Expect(vhost.Routes).To(HaveLen(1))
 		}
+	})
+
+	t.Run("waypoint filtering partitions wildcard services", func(t *testing.T) {
+		g := NewWithT(t)
+		direct := &model.Service{
+			Hostname:       "direct.example.org",
+			DefaultAddress: "10.0.0.1",
+			Ports:          model.PortList{&model.Port{Name: "http", Port: 8080, Protocol: protocol.HTTP}},
+		}
+		waypoint := &model.Service{
+			Hostname:       "waypoint.example.org",
+			DefaultAddress: "10.0.0.2",
+			Ports:          model.PortList{&model.Port{Name: "http", Port: 8080, Protocol: protocol.HTTP}},
+		}
+		serviceRegistry := map[host.Name]*model.Service{
+			direct.Hostname:   direct,
+			waypoint.Hostname: waypoint,
+		}
+		wildcardIndex := map[host.Name]types.NamespacedName{
+			direct.Hostname:   virtualServiceWithWildcardHost.NamespacedName(),
+			waypoint.Hostname: virtualServiceWithWildcardHost.NamespacedName(),
+		}
+		cg := core.NewConfigGenTest(t, core.TestOptions{Services: []*model.Service{direct, waypoint}})
+
+		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
+			[]config.Config{virtualServiceWithWildcardHost}, 8080, wildcardIndex, sets.New(waypoint.Key()),
+		)
+
+		g.Expect(vhosts).To(HaveLen(2))
+		byService := map[host.Name]route.VirtualHostWrapper{}
+		for _, vhost := range vhosts {
+			for _, svc := range vhost.Services {
+				byService[svc.Hostname] = vhost
+			}
+		}
+		g.Expect(byService[direct.Hostname].Routes[0].Name).NotTo(Equal(route.DefaultRouteName))
+		g.Expect(byService[waypoint.Hostname].Routes[0].Name).To(Equal(route.DefaultRouteName))
+	})
+
+	t.Run("headless waypoint service retains virtual service routes", func(t *testing.T) {
+		g := NewWithT(t)
+		headless := &model.Service{
+			Hostname:       "headless.example.org",
+			DefaultAddress: constants.UnspecifiedIP,
+			Ports:          model.PortList{&model.Port{Name: "http", Port: 8080, Protocol: protocol.HTTP}},
+		}
+		serviceRegistry := map[host.Name]*model.Service{headless.Hostname: headless}
+		wildcardIndex := map[host.Name]types.NamespacedName{
+			headless.Hostname: virtualServiceWithWildcardHost.NamespacedName(),
+		}
+		cg := core.NewConfigGenTest(t, core.TestOptions{Services: []*model.Service{headless}})
+
+		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
+			[]config.Config{virtualServiceWithWildcardHost}, 8080, wildcardIndex, sets.New(headless.Key()),
+		)
+
+		g.Expect(vhosts).To(HaveLen(1))
+		g.Expect(vhosts[0].Services).To(ConsistOf(headless))
+		g.Expect(vhosts[0].Routes[0].Name).NotTo(Equal(route.DefaultRouteName))
+	})
+
+	t.Run("waypoint ownership is namespace qualified", func(t *testing.T) {
+		g := NewWithT(t)
+		direct := &model.Service{
+			Hostname:       "shared.example.org",
+			DefaultAddress: "10.0.0.1",
+			Ports:          model.PortList{&model.Port{Name: "http", Port: 8080, Protocol: protocol.HTTP}},
+			Attributes:     model.ServiceAttributes{Namespace: "direct-ns"},
+		}
+		waypointOwned := &model.Service{
+			Hostname:   direct.Hostname,
+			Attributes: model.ServiceAttributes{Namespace: "waypoint-ns"},
+		}
+		serviceRegistry := map[host.Name]*model.Service{direct.Hostname: direct}
+		wildcardIndex := map[host.Name]types.NamespacedName{
+			direct.Hostname: virtualServiceWithWildcardHost.NamespacedName(),
+		}
+		cg := core.NewConfigGenTest(t, core.TestOptions{Services: []*model.Service{direct}})
+
+		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
+			[]config.Config{virtualServiceWithWildcardHost}, 8080, wildcardIndex, sets.New(waypointOwned.Key()),
+		)
+
+		g.Expect(vhosts).To(HaveLen(1))
+		g.Expect(vhosts[0].Services).To(ConsistOf(direct))
+		g.Expect(vhosts[0].Routes[0].Name).NotTo(Equal(route.DefaultRouteName))
 	})
 
 	t.Run("for virtual service with routing to an service with inference semantics", func(t *testing.T) {
@@ -1338,7 +1424,7 @@ func TestBuildHTTPRoutes(t *testing.T) {
 		}
 
 		vhosts := route.BuildSidecarVirtualHostWrapper(nil, node(cg), cg.PushContext(), serviceRegistry,
-			[]config.Config{virtualServiceWithGoogleWildcardHost}, 80, wildcardIndex,
+			[]config.Config{virtualServiceWithGoogleWildcardHost}, 80, wildcardIndex, nil,
 		)
 		// The service hosts (*.example.org and goodbye.hello.example.org) and the unattached VS host (*.google.com)
 		g.Expect(vhosts).To(HaveLen(3))

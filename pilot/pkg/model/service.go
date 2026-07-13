@@ -947,7 +947,10 @@ type ServiceDiscovery interface {
 }
 
 type AmbientIndexes interface {
-	ServicesWithWaypoint(key string) []ServiceWaypointInfo
+	// ServicesWithWaypoint returns waypoint-bound services from clusterID. An
+	// empty clusterID preserves the aggregate, cross-cluster lookup used by
+	// waypoint and ingress code.
+	ServicesWithWaypoint(key string, clusterID cluster.ID) []ServiceWaypointInfo
 	AddressInformation(addresses sets.String) ([]AddressInfo, sets.String)
 	AdditionalPodSubscriptions(
 		proxy *Proxy,
@@ -1045,7 +1048,7 @@ func (u NoopAmbientIndexes) WorkloadsForWaypoint(WaypointKey) []WorkloadInfo {
 	return nil
 }
 
-func (u NoopAmbientIndexes) ServicesWithWaypoint(string) []ServiceWaypointInfo {
+func (u NoopAmbientIndexes) ServicesWithWaypoint(string, cluster.ID) []ServiceWaypointInfo {
 	return nil
 }
 

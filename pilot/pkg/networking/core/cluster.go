@@ -49,6 +49,23 @@ import (
 // in this map, then delta calculation is triggered.
 var deltaConfigTypes = sets.New(kind.ServiceEntry.String(), kind.DestinationRule.String())
 
+// serviceWaypointKeys returns namespace-qualified keys of concrete services
+// whose service-addressed traffic should be delegated to a waypoint. Callers
+// use a set because route/listener/cluster generation repeatedly checks the
+// same snapshot of services.
+func serviceWaypointKeys(node *model.Proxy, push *model.PushContext) sets.Set[string] {
+	res := sets.New[string]()
+	if !node.EnableSidecarWaypointRouting() {
+		return res
+	}
+	for _, info := range push.ServicesWithWaypoint("", node.GetClusterID()) {
+		if info.Service != nil {
+			res.Insert(info.Service.Namespace + "/" + info.Service.Hostname)
+		}
+	}
+	return res
+}
+
 // BuildClusters returns the list of clusters for the given proxy. This is the CDS output
 // For outbound: Cluster for each service/subset hostname or cidr with SNI set to service hostname
 // Cluster type based on resolution
@@ -269,8 +286,8 @@ func (configgen *ConfigGeneratorImpl) buildClusters(proxy *model.Proxy, req *mod
 		clusters = append(clusters, patcher.insertedClusters()...)
 	}
 
-	// OutboundTunnel cluster is needed for sidecar and gateway.
-	if features.EnableHBONESend && proxy.Type != model.Waypoint && bool(!proxy.Metadata.DisableHBONESend) {
+	// OutboundTunnel cluster is needed for HBONE senders other than waypoints.
+	if proxy.EnableHBONESend() && !proxy.IsWaypointProxy() {
 		clusters = append(clusters, cb.buildConnectOriginate(proxy, req.Push, nil))
 	}
 
@@ -310,6 +327,7 @@ func (configgen *ConfigGeneratorImpl) buildOutboundClusters(cb *ClusterBuilder, 
 ) ([]*discovery.Resource, cacheStats) {
 	resources := make([]*discovery.Resource, 0)
 	efKeys := cp.efw.KeysApplyingTo(networking.EnvoyFilter_CLUSTER)
+	waypointServiceKeys := serviceWaypointKeys(proxy, cb.req.Push)
 	hit, miss := 0, 0
 	for _, service := range services {
 		if service.Resolution == model.Alias {
@@ -336,6 +354,13 @@ func (configgen *ConfigGeneratorImpl) buildOutboundClusters(cb *ClusterBuilder, 
 
 			// create default cluster
 			discoveryType := convertResolution(cb.proxyType, service)
+			// Waypoint endpoint substitution happens through EDS. Convert DNS
+			// clusters for waypoint-bound, VIP-addressed services so the
+			// sidecar can receive waypoint endpoints.
+			if clusterKey.waypoint && waypointServiceKeys.Contains(service.Key()) &&
+				(discoveryType == cluster.Cluster_STRICT_DNS || discoveryType == cluster.Cluster_LOGICAL_DNS) {
+				discoveryType = cluster.Cluster_EDS
+			}
 			defaultCluster := cb.buildCluster(clusterKey.clusterName, discoveryType, lbEndpoints, model.TrafficDirectionOutbound, port, service, nil, "")
 			if defaultCluster == nil {
 				continue

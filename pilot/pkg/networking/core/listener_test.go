@@ -61,6 +61,7 @@ import (
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/wellknown"
+	"istio.io/istio/pkg/workloadapi"
 )
 
 const (
@@ -490,6 +491,138 @@ func TestOutboundListenerConfig_WithSidecar(t *testing.T) {
 	}
 	services = append(services, service6)
 	testOutboundListenerConfigWithSidecar(t, services...)
+}
+
+// TestWaypointInteropSharedTCPListenerCharacterization documents a known limitation:
+// direct and waypoint-owned services cannot safely share an outbound raw-TCP
+// listener when their filter-chain matches overlap. The chain built first wins
+// the merge conflict, so reversing service creation order changes the selected
+// cluster. This test intentionally characterizes current behavior; it does not
+// assert that the behavior is desirable.
+func TestWaypointInteropSharedTCPListenerCharacterization(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableHBONESend, true)
+	test.SetForTest(t, &features.EnableSidecarWaypointRouting, true)
+
+	const (
+		namespace        = "not-default"
+		port             = 9000
+		directHostname   = "direct.example.org"
+		waypointHostname = "waypoint.example.org"
+		alternateHost    = "alternate.example.org"
+	)
+	service := func(hostname, address string, created time.Time) *model.Service {
+		return &model.Service{
+			CreationTime:   created,
+			Hostname:       host.Name(hostname),
+			DefaultAddress: address,
+			Ports: model.PortList{&model.Port{
+				Name:     "tcp",
+				Port:     port,
+				Protocol: protocol.TCP,
+			}},
+			Resolution: model.ClientSideLB,
+			Attributes: model.ServiceAttributes{
+				Name:      strings.Split(hostname, ".")[0],
+				Namespace: namespace,
+			},
+		}
+	}
+	sidecarConfig := &config.Config{
+		Meta: config.Meta{Name: "shared-tcp", Namespace: namespace, GroupVersionKind: gvk.Sidecar},
+		Spec: &networking.Sidecar{Egress: []*networking.IstioEgressListener{{
+			Bind: "0.0.0.0",
+			Port: &networking.SidecarPort{
+				Number:   port,
+				Name:     "shared-tcp",
+				Protocol: "TCP",
+			},
+			Hosts: []string{"*/*"},
+		}}},
+	}
+	virtualService := &config.Config{
+		Meta: config.Meta{Name: "direct-policy", Namespace: namespace, GroupVersionKind: gvk.VirtualService},
+		Spec: &networking.VirtualService{
+			Hosts:    []string{directHostname},
+			Gateways: []string{constants.IstioMeshGateway},
+			Tcp: []*networking.TCPRoute{{
+				Route: []*networking.RouteDestination{{Destination: &networking.Destination{
+					Host: alternateHost,
+					Port: &networking.PortSelector{Number: port},
+				}}},
+			}},
+		},
+	}
+
+	for _, tt := range []struct {
+		name                 string
+		directCreationTime   time.Time
+		waypointCreationTime time.Time
+		wantCluster          string
+		wantRetained         string
+		wantDiscarded        string
+	}{
+		{
+			name:                 "direct service chain is built first",
+			directCreationTime:   tnow,
+			waypointCreationTime: tnow.Add(time.Second),
+			wantCluster:          model.BuildSubsetKey(model.TrafficDirectionOutbound, "", alternateHost, port),
+			wantRetained:         namespace + "/" + directHostname,
+			wantDiscarded:        namespace + "/" + waypointHostname,
+		},
+		{
+			name:                 "waypoint service chain is built first",
+			directCreationTime:   tnow.Add(time.Second),
+			waypointCreationTime: tnow,
+			wantCluster:          model.BuildSubsetKey(model.TrafficDirectionOutbound, "", waypointHostname, port),
+			wantRetained:         namespace + "/" + waypointHostname,
+			wantDiscarded:        namespace + "/" + directHostname,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			direct := service(directHostname, "10.0.0.1", tt.directCreationTime)
+			waypointOwned := service(waypointHostname, "10.0.0.2", tt.waypointCreationTime)
+			alternate := service(alternateHost, "10.0.0.3", tnow.Add(2*time.Second))
+			cg := NewConfigGenTest(t, TestOptions{
+				Services:       []*model.Service{direct, waypointOwned, alternate},
+				ConfigPointers: []*config.Config{sidecarConfig, virtualService},
+			})
+			cg.MemRegistry.WantServicesWithWaypoint = []model.ServiceWaypointInfo{{
+				Service:          &workloadapi.Service{Namespace: namespace, Hostname: waypointHostname},
+				WaypointHostname: "waypoint-gateway." + namespace + ".svc.cluster.local",
+			}}
+
+			proxy := cg.SetupProxy(getProxy())
+			listeners := NewListenerBuilder(proxy, cg.env.PushContext()).buildSidecarOutboundListeners(proxy, cg.env.PushContext())
+			xdstest.ValidateListeners(t, listeners)
+			l := findListenerByPort(listeners, port)
+			if l == nil {
+				t.Fatalf("listener on port %d not found", port)
+			}
+			fc := getTCPFilterChain(t, l)
+			tcpProxy := &tcp.TcpProxy{}
+			if err := getFilterConfig(getTCPFilter(fc), tcpProxy); err != nil {
+				t.Fatalf("failed to decode TCP proxy: %v", err)
+			}
+			if got := tcpProxy.GetCluster(); got != tt.wantCluster {
+				t.Fatalf("selected cluster = %q, want %q", got, tt.wantCluster)
+			}
+
+			conflicts := cg.env.PushContext().GetMetric(model.ProxyStatusConflictOutboundListenerWaypoint.Name())
+			found := false
+			for _, conflict := range conflicts {
+				if strings.Contains(conflict.Message, "retaining service "+tt.wantRetained) &&
+					strings.Contains(conflict.Message, "discarding service "+tt.wantDiscarded) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("waypoint listener conflicts = %v, want retained service %s and discarded service %s",
+					conflicts, tt.wantRetained, tt.wantDiscarded)
+			}
+		})
+	}
 }
 
 func TestOutboundListenerConflictWithReservedListener(t *testing.T) {

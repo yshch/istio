@@ -270,7 +270,41 @@ func (a *index) buildGlobalCollections(
 		opts.WithName("GlobalMergedServiceInfos")...,
 	)
 
-	GobalWorkloadServicesWithClusterByCluster := nestedCollectionIndexByCluster(GlobalWorkloadServicesWithCluster)
+	GlobalWorkloadServicesWithClusterByCluster := nestedCollectionIndexByCluster(GlobalWorkloadServicesWithCluster)
+	ClusteredServiceCollections := krt.NewCollection(GlobalWorkloadServicesWithCluster,
+		func(_ krt.HandlerContext, services krt.Collection[krt.ObjectWithCluster[model.ServiceInfo]]) *krt.Collection[clusteredServiceInfo] {
+			clustered := krt.NewCollection(services,
+				func(_ krt.HandlerContext, svc krt.ObjectWithCluster[model.ServiceInfo]) *clusteredServiceInfo {
+					if svc.Object == nil {
+						return nil
+					}
+					return &clusteredServiceInfo{ClusterID: svc.ClusterID, Service: *svc.Object}
+				}, opts.WithName("ClusteredServiceInfos")...)
+			return &clustered
+		}, opts.WithName("ClusteredServiceCollections")...)
+	ClusteredServices := krt.NestedJoinWithMergeCollection(ClusteredServiceCollections,
+		func(services []clusteredServiceInfo) *clusteredServiceInfo {
+			if len(services) == 0 {
+				return nil
+			}
+			// Cluster ID is part of the key, so duplicates only arise while a
+			// cluster informer is being replaced. Prefer the latest value.
+			return &services[len(services)-1]
+		}, opts.WithName("ClusteredServiceInfos")...)
+	ClusteredServicesByCluster := krt.NewIndex[cluster.ID, clusteredServiceInfo](
+		ClusteredServices, "clusteredServiceByCluster", func(s clusteredServiceInfo) []cluster.ID {
+			return []cluster.ID{s.ClusterID}
+		})
+	ClusteredServicesByKey := krt.NewIndex[clusterServiceKey, clusteredServiceInfo](
+		ClusteredServices, "clusteredServiceByKey", func(s clusteredServiceInfo) []clusterServiceKey {
+			return []clusterServiceKey{{ClusterID: s.ClusterID, ServiceKey: s.Service.ResourceName()}}
+		})
+	ClusteredServicesByAddress := krt.NewIndex[clusterNetworkAddress, clusteredServiceInfo](
+		ClusteredServices, "clusteredServiceByAddress", func(s clusteredServiceInfo) []clusterNetworkAddress {
+			return slices.Map(networkAddressFromService(s.Service), func(address networkAddress) clusterNetworkAddress {
+				return clusterNetworkAddress{ClusterID: s.ClusterID, Address: address}
+			})
+		})
 
 	LocalNamespacesInfo := krt.NewCollection(LocalNamespaces, func(ctx krt.HandlerContext, ns *v1.Namespace) *model.NamespaceInfo {
 		return &model.NamespaceInfo{
@@ -302,7 +336,7 @@ func (a *index) buildGlobalCollections(
 		WaypointsByCluster,
 		LocalWorkloadServices,
 		GlobalWorkloadServicesWithCluster,
-		GobalWorkloadServicesWithClusterByCluster,
+		GlobalWorkloadServicesWithClusterByCluster,
 		GlobalNetworks,
 		options.ClusterID,
 		options.Flags,
@@ -544,9 +578,15 @@ func (a *index) buildGlobalCollections(
 		return []networkAddress{netaddr}
 	})
 
-	if features.EnableIngressWaypointRouting {
+	// Keep merged ingress/east-west tracking and cluster-aware sidecar tracking
+	// separate. When both are enabled, the merged shim emits only changes to
+	// ingress opt-in; binding, waypoint replica, and waypoint workload changes
+	// come from the clustered shim, avoiding duplicate local pushes.
+	if features.EnableIngressWaypointRouting || features.EnableAmbientMultiNetwork {
 		RegisterEdsShim(
 			a.XDSUpdater,
+			features.EnableSidecarWaypointRouting,
+			features.EnableSidecarWaypointRouting,
 			SplitHorizonWorkloads,
 			LocalNamespacesInfo,
 			SplitHorizonWorkloadServiceIndex,
@@ -554,6 +594,9 @@ func (a *index) buildGlobalCollections(
 			SplitHorizonServiceAddressIndex, // TODO: should we consider allowing ingress -> remote services?
 			opts,
 		)
+	}
+	if features.EnableSidecarWaypointRouting {
+		RegisterClusteredEdsShim(a.XDSUpdater, GlobalWorkloads, ClusteredServices, ClusteredServicesByAddress, opts)
 	}
 	a.namespaces = LocalNamespacesInfo
 
@@ -570,6 +613,10 @@ func (a *index) buildGlobalCollections(
 		ByAddress:                SplitHorizonServiceAddressIndex,
 		ByOwningWaypointHostname: SplitHorizonServiceInfosByOwningWaypointHostname,
 		ByOwningWaypointIP:       SplitHorizonServiceInfosByOwningWaypointIP,
+		Clustered:                ClusteredServices,
+		ClusteredByCluster:       ClusteredServicesByCluster,
+		ClusteredByKey:           ClusteredServicesByKey,
+		ClusteredByAddress:       ClusteredServicesByAddress,
 	}
 	a.authorizationPolicies = AllPolicies
 	// TODO: Should this be the set of global waypoints?

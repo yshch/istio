@@ -71,18 +71,31 @@ func (c *Controller) ServicesForWaypoint(key model.WaypointKey) []model.ServiceI
 	return res
 }
 
-func (c *Controller) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
+func (c *Controller) ServicesWithWaypoint(key string, clusterID cluster.ID) []model.ServiceWaypointInfo {
 	if !features.EnableAmbient {
 		return nil
 	}
 	var res []model.ServiceWaypointInfo
 	for _, p := range c.GetRegistries() {
-		// If this is a kubernetes registry that isn't the local cluster, skip it.
-		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
-			// Only return workloads for the same cluster as the config cluster.
+		// Sidecar interoperability passes a cluster ID and is deliberately
+		// local-cluster only.  Other callers preserve the branch's
+		// config-cluster scoping.
+		if clusterID != "" {
+			if features.EnableAmbientMultiNetwork && p.Provider() == provider.Kubernetes {
+				// The config-cluster Kubernetes registry owns native ambient
+				// indexes for every cluster. Give it the requested cluster ID
+				// and ignore the legacy per-cluster Kubernetes registries for
+				// this lookup.
+				if p.Cluster() != c.configClusterID {
+					continue
+				}
+			} else if p.Cluster() != clusterID {
+				continue
+			}
+		} else if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
 			continue
 		}
-		res = append(res, p.ServicesWithWaypoint(key)...)
+		res = append(res, p.ServicesWithWaypoint(key, clusterID)...)
 	}
 	return res
 }

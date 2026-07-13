@@ -113,7 +113,7 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 
 	builder.patchListeners()
 	l := builder.getListeners()
-	if features.EnableHBONESend && !builder.node.IsWaypointProxy() {
+	if builder.node.EnableHBONESend() && !builder.node.IsWaypointProxy() {
 		class := istionetworking.ListenerClassSidecarOutbound
 		if node.Type == model.Router {
 			class = istionetworking.ListenerClassGateway
@@ -333,6 +333,7 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 
 	// For conflict resolution
 	listenerMap := make(map[listenerKey]*outboundListenerEntry)
+	waypointServiceKeys := serviceWaypointKeys(node, push)
 
 	// The sidecarConfig if provided could filter the list of
 	// services/virtual services that we need to process. It could also
@@ -424,11 +425,12 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 			// TODO: dualstack wildcards
 			for _, service := range services {
 				listenerOpts := outboundListenerOpts{
-					push:    push,
-					proxy:   node,
-					bind:    bind,
-					port:    listenPort,
-					service: service,
+					push:            push,
+					proxy:           node,
+					bind:            bind,
+					port:            listenPort,
+					service:         service,
+					serviceWaypoint: service.GetAddressForProxy(node) != constants.UnspecifiedIP && waypointServiceKeys.Contains(service.Key()),
 				}
 				// Set service specific attributes here.
 				lb.buildSidecarOutboundListener(listenerOpts, listenerMap, virtualServices, actualWildcards)
@@ -475,19 +477,21 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 						continue
 					}
 					listenerOpts := outboundListenerOpts{
-						push:    push,
-						proxy:   node,
-						bind:    bind,
-						port:    servicePort,
-						service: service,
+						push:            push,
+						proxy:           node,
+						bind:            bind,
+						port:            servicePort,
+						service:         service,
+						serviceWaypoint: saddress != constants.UnspecifiedIP && waypointServiceKeys.Contains(service.Key()),
 					}
 
 					// Support statefulsets/headless services with TCP ports, and empty service address field.
 					// Instead of generating a single 0.0.0.0:Port listener, generate a listener
 					// for each instance. HTTP services can happily reside on 0.0.0.0:PORT and use the
 					// wildcard route match to get to the appropriate IP through original dst clusters.
-					if bind.Primary() == "" && service.Resolution == model.Passthrough &&
-						saddress == constants.UnspecifiedIP && (servicePort.Protocol.IsTCP() || servicePort.Protocol.IsUnsupported()) {
+					if bind.Primary() == "" && !listenerOpts.serviceWaypoint &&
+						service.Resolution == model.Passthrough && saddress == constants.UnspecifiedIP &&
+						(servicePort.Protocol.IsTCP() || servicePort.Protocol.IsUnsupported()) {
 						instances := push.ServiceEndpointsByPort(service, servicePort.Port, nil)
 						if service.Attributes.ServiceRegistry != provider.Kubernetes && len(instances) == 0 && service.Attributes.LabelSelectors == nil {
 							// A Kubernetes service with no endpoints means there are no endpoints at
@@ -918,6 +922,9 @@ func (lb *ListenerBuilder) buildSidecarOutboundListener(listenerOpts outboundLis
 			}
 
 		case istionetworking.ListenerProtocolTCP:
+			if listenerOpts.serviceWaypoint {
+				virtualServices = nil
+			}
 			opts = buildSidecarOutboundTCPListenerOpts(listenerOpts, virtualServices)
 
 			// Check if conflict happens
@@ -945,6 +952,11 @@ func (lb *ListenerBuilder) buildSidecarOutboundListener(listenerOpts outboundLis
 				}
 			}
 			// Add tcp filter chain, build TCP filter chain first.
+			// For waypoint-bound services, the waypoint applies service-level
+			// TCP/TLS routes after delegation.
+			if listenerOpts.serviceWaypoint {
+				virtualServices = nil
+			}
 			tcpOpts := buildSidecarOutboundTCPListenerOpts(listenerOpts, virtualServices)
 
 			// Add http filter chain and tcp filter chain to the listener opts
@@ -974,6 +986,10 @@ func (lb *ListenerBuilder) buildSidecarOutboundListener(listenerOpts outboundLis
 			listenerOpts.port.Port, listenerOpts.port.Protocol, currentListenerEntry.protocol, conflictType)
 		return
 	}
+
+	// Retain the source service on TCP/TLS chains so collisions between direct
+	// and waypoint-owned services can produce actionable diagnostics.
+	setTCPFilterChainService(opts, listenerOpts)
 
 	// In general, for handling conflicts we:
 	// * Turn on sniffing if its HTTP and TCP mixed
@@ -1043,6 +1059,11 @@ type filterChainOpts struct {
 	applicationProtocols []string
 	transportProtocol    string
 
+	// Source service information is retained for actionable diagnostics when
+	// otherwise identical chains for direct and waypoint-owned services collide.
+	serviceKey      string
+	serviceWaypoint bool
+
 	// Arbitrary metadata to attach to the filter
 	metadata *core.Metadata
 
@@ -1079,6 +1100,9 @@ type outboundListenerOpts struct {
 
 	port    *model.Port
 	service *model.Service
+	// serviceWaypoint suppresses sidecar TCP/TLS VirtualService routing.
+	// The waypoint applies the service-level routes after delegation.
+	serviceWaypoint bool
 }
 
 // buildGatewayListener builds and initializes a Listener proto based on the provided opts. It does not set any filters.
@@ -1281,6 +1305,18 @@ func (chain *filterChainOpts) toFilterChainMatch() *listener.FilterChainMatch {
 	return match
 }
 
+func setTCPFilterChainService(chains []*filterChainOpts, opts outboundListenerOpts) {
+	if opts.service == nil {
+		return
+	}
+	for _, chain := range chains {
+		if chain.networkFilters != nil {
+			chain.serviceKey = opts.service.Key()
+			chain.serviceWaypoint = opts.serviceWaypoint
+		}
+	}
+}
+
 func mergeTCPFilterChains(current *outboundListenerEntry, incoming []*filterChainOpts, opts outboundListenerOpts) {
 	// TODO(rshriram) merge multiple identical filter chains with just a single destination CIDR based
 	// filter chain match, into a single filter chain and array of destinationcidr matches
@@ -1315,14 +1351,32 @@ func mergeTCPFilterChains(current *outboundListenerEntry, incoming []*filterChai
 					newHostname = "sidecar-config-egress-tcp-listener"
 				}
 
+				listenerName := getListenerName(opts.bind.Primary(), opts.port.Port, istionetworking.TransportProtocolTCP)
 				outboundListenerConflict{
 					metric:          model.ProxyStatusConflictOutboundListenerTCPOverTCP,
 					node:            opts.proxy,
-					listenerName:    getListenerName(opts.bind.Primary(), opts.port.Port, istionetworking.TransportProtocolTCP),
+					listenerName:    listenerName,
 					currentProtocol: current.servicePort.Protocol,
 					newHostname:     newHostname,
 					newProtocol:     opts.port.Protocol,
 				}.addMetric(opts.push)
+				if existing.serviceKey != "" && incoming.serviceKey != "" &&
+					existing.serviceWaypoint != incoming.serviceWaypoint {
+					msg := fmt.Sprintf(
+						"Listener=%s has identical TCP/TLS filter-chain matches for direct and waypoint-owned services; "+
+							"retaining service %s and discarding service %s",
+						listenerName, existing.serviceKey, incoming.serviceKey)
+					directService, waypointService := incoming.serviceKey, existing.serviceKey
+					if incoming.serviceWaypoint {
+						directService, waypointService = existing.serviceKey, incoming.serviceKey
+					}
+					// Include both services in the key so multiple collisions on one
+					// shared listener remain visible in proxy status.
+					metricKey := listenerName + "/" + directService + "/" + waypointService
+					opts.push.AddMetric(model.ProxyStatusConflictOutboundListenerWaypoint,
+						metricKey, opts.proxy.ID, msg)
+					log.Warnf("%s for proxy %s", msg, opts.proxy.ID)
+				}
 				break
 			}
 		}

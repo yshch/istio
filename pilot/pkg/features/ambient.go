@@ -60,6 +60,9 @@ var (
 	EnableIngressWaypointRouting = registerAmbient("ENABLE_INGRESS_WAYPOINT_ROUTING", true, false,
 		"If true, Gateways will call service waypoints if the 'istio.io/ingress-use-waypoint' label set on the Service.")
 
+	EnableSidecarWaypointRouting = registerAmbient("ENABLE_SIDECAR_WAYPOINT_ROUTING", true, false,
+		"If true, sidecars will route eligible service-addressed traffic through the Service's local waypoint.")
+
 	EnableAmbientMultiNetwork = registerAmbient("AMBIENT_ENABLE_MULTI_NETWORK", false, false,
 		"If true, the multi-network functionality will be enabled.")
 
