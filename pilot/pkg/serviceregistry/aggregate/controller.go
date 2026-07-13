@@ -65,13 +65,19 @@ func (c *Controller) ServicesForWaypoint(key model.WaypointKey) []model.ServiceI
 	return res
 }
 
-func (c *Controller) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
+func (c *Controller) ServicesWithWaypoint(key string, clusterID cluster.ID) []model.ServiceWaypointInfo {
 	if !features.EnableAmbient {
 		return nil
 	}
 	var res []model.ServiceWaypointInfo
 	for _, p := range c.GetRegistries() {
-		res = append(res, p.ServicesWithWaypoint(key)...)
+		// Sidecar interoperability is deliberately local-cluster only. Without
+		// this filter, replicated services can yield multiple waypoint
+		// bindings and callers may select one according to registry order.
+		if clusterID != "" && p.Cluster() != clusterID {
+			continue
+		}
+		res = append(res, p.ServicesWithWaypoint(key, clusterID)...)
 	}
 	return res
 }

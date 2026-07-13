@@ -371,9 +371,10 @@ func New(options Options) Index {
 		PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
 	), false)
 
-	if features.EnableIngressWaypointRouting {
+	if features.EnableIngressWaypointRouting || features.EnableSidecarWaypointRouting {
 		RegisterEdsShim(
 			a.XDSUpdater,
+			features.EnableSidecarWaypointRouting,
 			Workloads,
 			NamespacesInfo,
 			WorkloadServiceIndex,

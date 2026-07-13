@@ -21,10 +21,100 @@ import (
 
 	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/workloadapi"
 )
+
+func TestServiceEDSEquals(t *testing.T) {
+	workload := func(uid string, labels map[string]string) model.WorkloadInfo {
+		return model.WorkloadInfo{
+			Workload: &workloadapi.Workload{Uid: uid},
+			Labels:   labels,
+		}
+	}
+	sorted := func(workloads ...model.WorkloadInfo) []model.WorkloadInfo {
+		return slices.SortBy(workloads, func(w model.WorkloadInfo) string {
+			return w.Workload.Uid
+		})
+	}
+
+	base := serviceEDS{
+		ServiceKey:         "ns/service.example.com",
+		WaypointServiceKey: "ns/waypoint-a.example.com",
+		WaypointInstance: sorted(
+			workload("waypoint-b", map[string]string{"version": "v1"}),
+			workload("waypoint-a", map[string]string{"version": "v1"}),
+		),
+		UseWaypoint: true,
+	}
+	reordered := serviceEDS{
+		ServiceKey:         "ns/service.example.com",
+		WaypointServiceKey: "ns/waypoint-a.example.com",
+		WaypointInstance: sorted(
+			workload("waypoint-a", map[string]string{"version": "v1"}),
+			workload("waypoint-b", map[string]string{"version": "v1"}),
+		),
+		UseWaypoint: true,
+	}
+	if !base.Equals(reordered) {
+		t.Fatal("workload fetch order should not affect equality after UID sorting")
+	}
+
+	metadataChanged := reordered
+	metadataChanged.WaypointInstance = sorted(
+		workload("waypoint-a", map[string]string{"version": "v2"}),
+		workload("waypoint-b", map[string]string{"version": "v1"}),
+	)
+	if base.Equals(metadataChanged) {
+		t.Fatal("metadata-only workload changes must affect equality")
+	}
+
+	waypointChanged := reordered
+	waypointChanged.WaypointServiceKey = "ns/waypoint-b.example.com"
+	if base.Equals(waypointChanged) {
+		t.Fatal("waypoint identity changes must affect equality")
+	}
+}
+
+func TestServiceEDSPushRequest(t *testing.T) {
+	base := serviceEDS{
+		ServiceKey:         "ns/service.example.com",
+		WaypointServiceKey: "ns/waypoint-a.example.com",
+		UseWaypoint:        true,
+	}
+	withReplica := base
+	withReplica.WaypointInstance = []model.WorkloadInfo{{Workload: &workloadapi.Workload{Uid: "waypoint-a"}}}
+	otherWaypoint := base
+	otherWaypoint.WaypointServiceKey = "ns/waypoint-b.example.com"
+
+	cases := []struct {
+		name  string
+		event krt.Event[serviceEDS]
+		full  bool
+	}{
+		{"ownership added", krt.Event[serviceEDS]{New: &base}, true},
+		{"ownership removed", krt.Event[serviceEDS]{Old: &base}, true},
+		{"selected waypoint changed", krt.Event[serviceEDS]{Old: &base, New: &otherWaypoint}, true},
+		{"same waypoint replicas changed", krt.Event[serviceEDS]{Old: &base, New: &withReplica}, false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := serviceEDSPushRequest([]krt.Event[serviceEDS]{tt.event})
+			if req == nil || req.Full != tt.full {
+				t.Fatalf("request = %#v, want Full=%v", req, tt.full)
+			}
+			want := model.ConfigKey{Kind: kind.ServiceEntry, Name: "service.example.com", Namespace: "ns"}
+			if !req.ConfigsUpdated.Contains(want) {
+				t.Fatalf("configs = %v, want %v", req.ConfigsUpdated, want)
+			}
+		})
+	}
+}
 
 func TestIngressInterop(t *testing.T) {
 	// Test that we can get updates for EDS when we have service bound waypoints.
@@ -34,7 +124,7 @@ func TestIngressInterop(t *testing.T) {
 	edsUpdate := s.hostnameForService
 	assertServicesWithWaypoint := func(want ...string) {
 		t.Helper()
-		got := s.ServicesWithWaypoint(s.svcXdsName("svc1"))
+		got := s.ServicesWithWaypoint(s.svcXdsName("svc1"), s.clusterID)
 		gots := slices.Map(got, func(e model.ServiceWaypointInfo) string {
 			return e.Service.Hostname + "/" + e.WaypointHostname
 		})
@@ -56,7 +146,7 @@ func TestIngressInterop(t *testing.T) {
 		map[string]string{},
 		map[string]string{},
 		[]int32{80}, map[string]string{"app": "waypoint"}, "10.0.0.1")
-	s.assertEvent(t, edsUpdate("svc1"))
+	s.fx.MatchOrFail(t, xdsfake.Event{Type: "xds full", ID: edsUpdate("svc1")})
 	assertServicesWithWaypoint(s.hostnameForService("svc1") + "/" + s.hostnameForService("wp-svc"))
 
 	// add a waypoint instance... we should get an EDS update
@@ -66,11 +156,16 @@ func TestIngressInterop(t *testing.T) {
 	s.assertEvent(t, edsUpdate("svc1"))
 	assertServicesWithWaypoint(s.hostnameForService("svc1") + "/" + s.hostnameForService("wp-svc"))
 
+	// A metadata-only change to an existing waypoint workload must also
+	// invalidate the destination service's EDS without changing replica count.
+	s.labelPod(t, "wp-pod1", testNS, map[string]string{"app": "waypoint", "version": "v2"})
+	s.assertEvent(t, edsUpdate("svc1"))
+
 	// now we are going to change to a different waypoint, this will be hostname based
 	s.addService(t, "svc1",
 		map[string]string{label.IoIstioUseWaypoint.Name: "wp-svc-host"},
 		map[string]string{},
 		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.2")
 	s.addWaypointSpecificAddress(t, "", "example.com", "wp-svc-host", constants.AllTraffic, true)
-	s.assertEvent(t, edsUpdate("svc1"))
+	s.fx.MatchOrFail(t, xdsfake.Event{Type: "xds full", ID: edsUpdate("svc1")})
 }

@@ -410,6 +410,7 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 		}
 	}
 
+	waypointServiceKeys := serviceWaypointKeys(node, push)
 	var routeCache *istio_route.Cache
 	if listenerPort > 0 && features.EnableRDSCaching {
 		// sort services, ensure that routeCache calculation result is stable
@@ -433,6 +434,7 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 			VirtualServices:         virtualServices,
 			DelegateVirtualServices: push.DelegateVirtualServices(virtualServices),
 			EnvoyFilterKeys:         efKeys,
+			WaypointServiceKeys:     waypointServiceKeys,
 		}
 	}
 
@@ -445,7 +447,7 @@ func BuildSidecarOutboundVirtualHosts(node *model.Proxy, push *model.PushContext
 	mostSpecificWildcardVsIndex := egressListener.MostSpecificWildcardVirtualServiceIndex()
 	// Get list of virtual services bound to the mesh gateway
 	virtualHostWrappers := istio_route.BuildSidecarVirtualHostWrapper(routeCache, node, push,
-		servicesByName, virtualServices, listenerPort, mostSpecificWildcardVsIndex,
+		servicesByName, virtualServices, listenerPort, mostSpecificWildcardVsIndex, waypointServiceKeys,
 	)
 
 	if features.EnableRDSCaching {

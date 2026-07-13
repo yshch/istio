@@ -20,10 +20,12 @@ import (
 	"strings"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 )
 
@@ -31,13 +33,72 @@ import (
 // For example, we may have ServiceKey=httpbin.org and WaypointInstance=[list of *waypoint workloads* attached].
 // This is to map to the eventual EDS structure.
 type serviceEDS struct {
-	ServiceKey       string
-	WaypointInstance []*workloadapi.Workload
-	UseWaypoint      bool
+	ServiceKey         string
+	WaypointServiceKey string
+	WaypointInstance   []model.WorkloadInfo
+	UseWaypoint        bool
 }
 
-func (w serviceEDS) ResourceName() string {
-	return w.ServiceKey
+func (s serviceEDS) ResourceName() string {
+	return s.ServiceKey
+}
+
+func (s serviceEDS) Equals(other serviceEDS) bool {
+	if s.ServiceKey != other.ServiceKey || s.WaypointServiceKey != other.WaypointServiceKey {
+		return false
+	}
+	if s.UseWaypoint != other.UseWaypoint {
+		return false
+	}
+	if len(s.WaypointInstance) != len(other.WaypointInstance) {
+		return false
+	}
+	// The builder sorts both slices by workload UID.
+	for i := range s.WaypointInstance {
+		if !s.WaypointInstance[i].Equals(other.WaypointInstance[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s serviceEDS) sameWaypointBinding(other serviceEDS) bool {
+	return s.ServiceKey == other.ServiceKey &&
+		s.WaypointServiceKey == other.WaypointServiceKey &&
+		s.UseWaypoint == other.UseWaypoint
+}
+
+// registerEdsShimPushes requests a full push when waypoint ownership changes,
+// since sidecar interop changes EDS, RDS, CDS, and LDS in that case. Changes to
+// replicas of the same waypoint remain incremental EDS updates.
+func registerEdsShimPushes(serviceEds krt.Collection[serviceEDS], xdsUpdater model.XDSUpdater) {
+	serviceEds.RegisterBatch(func(events []krt.Event[serviceEDS], _ bool) {
+		if req := serviceEDSPushRequest(events); req != nil {
+			xdsUpdater.ConfigUpdate(req)
+		}
+	}, false)
+}
+
+func serviceEDSPushRequest(events []krt.Event[serviceEDS]) *model.PushRequest {
+	configs := sets.New[model.ConfigKey]()
+	full := false
+	for _, event := range events {
+		if event.Old == nil || event.New == nil || !event.Old.sameWaypointBinding(*event.New) {
+			full = true
+		}
+		for _, svc := range event.Items() {
+			ns, hostname, _ := strings.Cut(svc.ServiceKey, "/")
+			configs.Insert(model.ConfigKey{Kind: kind.ServiceEntry, Name: hostname, Namespace: ns})
+		}
+	}
+	if configs.IsEmpty() {
+		return nil
+	}
+	return &model.PushRequest{
+		Full:           full,
+		ConfigsUpdated: configs,
+		Reason:         model.NewReasonStats(model.AmbientUpdate),
+	}
 }
 
 // RegisterEdsShim handles triggering xDS events when Envoy EDS needs to change.
@@ -48,6 +109,7 @@ func (w serviceEDS) ResourceName() string {
 // Ideally, the information we are using in Envoy and the event trigger are using the same data directly.
 func RegisterEdsShim(
 	xdsUpdater model.XDSUpdater,
+	includeAllServiceWaypoints bool,
 	Workloads krt.Collection[model.WorkloadInfo],
 	Namespaces krt.Collection[model.NamespaceInfo],
 	WorkloadsByServiceKey krt.Index[string, model.WorkloadInfo],
@@ -59,9 +121,7 @@ func RegisterEdsShim(
 		Services,
 		func(ctx krt.HandlerContext, svc model.ServiceInfo) *serviceEDS {
 			useWaypoint := ingressUseWaypoint(svc, krt.FetchOne(ctx, Namespaces, krt.FilterKey(svc.Service.Namespace)))
-			if !useWaypoint {
-				// Currently, we only need this for ingres -> waypoint usage
-				// If we extend this to sidecars, etc we can drop this.
+			if !includeAllServiceWaypoints && !useWaypoint {
 				return nil
 			}
 			wp := svc.Service.Waypoint
@@ -88,23 +148,23 @@ func RegisterEdsShim(
 				waypointServiceKey = waypointSvc.ResourceName()
 			}
 			workloads := krt.Fetch(ctx, Workloads, krt.FilterIndex(WorkloadsByServiceKey, waypointServiceKey))
+			// serviceEDS.Equals compares workloads positionally, so normalize the
+			// non-deterministic index result before constructing the value.
+			workloads = slices.SortBy(workloads, func(i model.WorkloadInfo) string {
+				return i.Workload.Uid
+			})
 			return &serviceEDS{
-				ServiceKey:  svc.ResourceName(),
-				UseWaypoint: useWaypoint,
-				WaypointInstance: slices.Map(workloads, func(e model.WorkloadInfo) *workloadapi.Workload {
-					return e.Workload
-				}),
+				ServiceKey:         svc.ResourceName(),
+				WaypointServiceKey: waypointServiceKey,
+				UseWaypoint:        useWaypoint,
+				WaypointInstance:   workloads,
 			}
 		},
 		opts.WithName("ServiceEds")...)
-	ServiceEds.RegisterBatch(
-		PushXds(xdsUpdater, func(svc serviceEDS) model.ConfigKey {
-			ns, hostname, _ := strings.Cut(svc.ServiceKey, "/")
-			return model.ConfigKey{Kind: kind.ServiceEntry, Name: hostname, Namespace: ns}
-		}), false)
+	registerEdsShimPushes(ServiceEds, xdsUpdater)
 }
 
-func (a *index) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
+func (a *index) ServicesWithWaypoint(key string, _ cluster.ID) []model.ServiceWaypointInfo {
 	res := []model.ServiceWaypointInfo{}
 	var svcs []model.ServiceInfo
 	if key == "" {

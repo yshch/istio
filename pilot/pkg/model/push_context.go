@@ -656,6 +656,13 @@ var (
 		"Number of conflicting tcp listeners with current tcp listener.",
 	)
 
+	// ProxyStatusConflictOutboundListenerWaypoint tracks ambiguous shared TCP/TLS
+	// listeners where direct and waypoint-owned services have identical filter-chain matches.
+	ProxyStatusConflictOutboundListenerWaypoint = monitoring.NewGauge(
+		"pilot_conflict_outbound_listener_waypoint",
+		"Number of direct and waypoint-owned services with conflicting outbound listener filter chains.",
+	)
+
 	// ProxyStatusConflictInboundListener tracks cases of multiple inbound
 	// listeners - 2 services selecting the same port of the pod.
 	ProxyStatusConflictInboundListener = monitoring.NewGauge(
@@ -714,6 +721,7 @@ var (
 		ProxyStatusNoService,
 		ProxyStatusEndpointNotReady,
 		ProxyStatusConflictOutboundListenerTCPOverTCP,
+		ProxyStatusConflictOutboundListenerWaypoint,
 		ProxyStatusConflictInboundListener,
 		DuplicatedClusters,
 		ProxyStatusClusterNoInstances,
@@ -2556,8 +2564,10 @@ func (ps *PushContext) ServicesForWaypoint(key WaypointKey) []ServiceInfo {
 	return ps.ambientIndex.ServicesForWaypoint(key)
 }
 
-// ServicesWithWaypoint returns all services associated with any waypoint.
-// Key can optionally be provided in the form 'namespace/hostname'. If unset, all are returned
-func (ps *PushContext) ServicesWithWaypoint(key string) []ServiceWaypointInfo {
-	return ps.ambientIndex.ServicesWithWaypoint(key)
+// ServicesWithWaypoint returns services associated with a waypoint in
+// clusterID.  Key can optionally be provided in the form 'namespace/hostname'.
+// If unset, all are returned.  An empty clusterID preserves the aggregate
+// lookup used outside sidecar interoperability.
+func (ps *PushContext) ServicesWithWaypoint(key string, clusterID cluster.ID) []ServiceWaypointInfo {
+	return ps.ambientIndex.ServicesWithWaypoint(key, clusterID)
 }

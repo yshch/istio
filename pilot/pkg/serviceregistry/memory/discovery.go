@@ -52,6 +52,7 @@ type ServiceDiscovery struct {
 	InstancesError             error
 	Controller                 model.Controller
 	ClusterID                  cluster.ID
+	WantServicesWithWaypoint   []model.ServiceWaypointInfo
 
 	// Used by GetProxyWorkloadLabels
 	ip2workloadLabels map[string]labels.Instance
@@ -376,8 +377,8 @@ func (sd *ServiceDiscovery) ServicesForWaypoint(model.WaypointKey) []model.Servi
 	return nil
 }
 
-func (sd *ServiceDiscovery) ServicesWithWaypoint(string) []model.ServiceWaypointInfo {
-	return nil
+func (sd *ServiceDiscovery) ServicesWithWaypoint(string, cluster.ID) []model.ServiceWaypointInfo {
+	return sd.WantServicesWithWaypoint
 }
 
 func (sd *ServiceDiscovery) Waypoint(string, string) []netip.Addr {

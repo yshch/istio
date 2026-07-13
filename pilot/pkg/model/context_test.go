@@ -22,13 +22,83 @@ import (
 
 	structpb "google.golang.org/protobuf/types/known/structpb"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/mock"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/protomarshal"
 )
+
+func TestEnableHBONESend(t *testing.T) {
+	cases := []struct {
+		name           string
+		proxy          *model.Proxy
+		globallyEnable bool
+		want           bool
+	}{
+		{"globally enabled", &model.Proxy{Metadata: &model.NodeMetadata{}}, true, true},
+		{"globally disabled", &model.Proxy{Metadata: &model.NodeMetadata{}}, false, false},
+		{"disabled for proxy", &model.Proxy{Metadata: &model.NodeMetadata{DisableHBONESend: true}}, true, false},
+		{"waypoint always enabled", &model.Proxy{Type: model.Waypoint, Metadata: &model.NodeMetadata{DisableHBONESend: true}}, false, true},
+		{"ztunnel always enabled", &model.Proxy{Type: model.Ztunnel}, false, true},
+		{"missing metadata", &model.Proxy{}, true, false},
+		{"nil proxy", nil, true, false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.EnableHBONESend, tt.globallyEnable)
+			if got := tt.proxy.EnableHBONESend(); got != tt.want {
+				t.Fatalf("EnableHBONESend() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnableSidecarWaypointRouting(t *testing.T) {
+	cases := []struct {
+		name    string
+		proxy   *model.Proxy
+		feature bool
+		hbone   bool
+		want    bool
+	}{
+		{"feature off, HBONE on", &model.Proxy{Type: model.SidecarProxy, Metadata: &model.NodeMetadata{}}, false, true, false},
+		{"feature on, HBONE off", &model.Proxy{Type: model.SidecarProxy, Metadata: &model.NodeMetadata{}}, true, false, false},
+		{"feature and HBONE on", &model.Proxy{Type: model.SidecarProxy, Metadata: &model.NodeMetadata{}}, true, true, true},
+		{"HBONE disabled for proxy", &model.Proxy{Type: model.SidecarProxy, Metadata: &model.NodeMetadata{DisableHBONESend: true}}, true, true, false},
+		{"missing metadata", &model.Proxy{Type: model.SidecarProxy}, true, true, false},
+		{"nil proxy", nil, true, true, false},
+		{"waypoint", &model.Proxy{Type: model.Waypoint, Metadata: &model.NodeMetadata{}}, true, true, false},
+		{"ztunnel", &model.Proxy{Type: model.Ztunnel, Metadata: &model.NodeMetadata{}}, true, true, false},
+		{"router", &model.Proxy{Type: model.Router, Metadata: &model.NodeMetadata{}}, true, true, false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.EnableSidecarWaypointRouting, tt.feature)
+			test.SetForTest(t, &features.EnableHBONESend, tt.hbone)
+			if got := tt.proxy.EnableSidecarWaypointRouting(); got != tt.want {
+				t.Fatalf("EnableSidecarWaypointRouting() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnableHBONEListenHandlesIncompleteProxy(t *testing.T) {
+	test.SetForTest(t, &features.EnableSidecarHBONEListening, true)
+	for name, proxy := range map[string]*model.Proxy{
+		"nil proxy":        nil,
+		"missing metadata": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if proxy.EnableHBONEListen() {
+				t.Fatal("expected HBONE listening to be disabled")
+			}
+		})
+	}
+}
 
 func TestServiceNode(t *testing.T) {
 	cases := []struct {

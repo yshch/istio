@@ -23,6 +23,7 @@ import (
 	"go.uber.org/atomic"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
@@ -30,6 +31,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
@@ -106,6 +108,22 @@ func buildMockControllerForMultiCluster() (*Controller, *memory.ServiceDiscovery
 	ctls.AddRegistry(registry2)
 
 	return ctls, discovery1, discovery2
+}
+
+func TestServicesWithWaypointForCluster(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	aggregateCtl, registry1, registry2 := buildMockControllerForMultiCluster()
+	registry1.WantServicesWithWaypoint = []model.ServiceWaypointInfo{{WaypointHostname: "waypoint.cluster-1"}}
+	registry2.WantServicesWithWaypoint = []model.ServiceWaypointInfo{{WaypointHostname: "waypoint.cluster-2"}}
+
+	got := aggregateCtl.ServicesWithWaypoint("ns/service.example.com", "cluster-1")
+	if len(got) != 1 || got[0].WaypointHostname != "waypoint.cluster-1" {
+		t.Fatalf("local cluster lookup got %v, want cluster-1 waypoint", got)
+	}
+	got = aggregateCtl.ServicesWithWaypoint("ns/service.example.com", "")
+	if len(got) != 2 {
+		t.Fatalf("aggregate lookup got %v, want both cluster waypoints", got)
+	}
 }
 
 func TestServicesForMultiCluster(t *testing.T) {

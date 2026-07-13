@@ -50,6 +50,7 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/jwt"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/grpc"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/wellknown"
@@ -100,6 +101,7 @@ type VirtualHostWrapper struct {
 // The list of Services is also passed to allow maintaining consistent ordering.
 func BuildSidecarVirtualHostWrapper(routeCache *Cache, node *model.Proxy, push *model.PushContext, serviceRegistry map[host.Name]*model.Service,
 	virtualServices []config.Config, listenPort int, mostSpecificWildcardVsIndex map[host.Name]types.NamespacedName,
+	waypointServiceKeys sets.Set[string],
 ) []VirtualHostWrapper {
 	out := make([]VirtualHostWrapper, 0)
 
@@ -113,6 +115,7 @@ func BuildSidecarVirtualHostWrapper(routeCache *Cache, node *model.Proxy, push *
 		dependentDestinationRules = append(dependentDestinationRules, destinationRules...)
 		wrappers := buildSidecarVirtualHostsForVirtualService(
 			node, virtualService, serviceRegistry, hashByDestination, listenPort, push.Mesh, mostSpecificWildcardVsIndex,
+			waypointServiceKeys,
 		)
 		out = append(out, wrappers...)
 	}
@@ -243,6 +246,7 @@ func buildSidecarVirtualHostsForVirtualService(
 	listenPort int,
 	mesh *meshconfig.MeshConfig,
 	mostSpecificWildcardVsIndex map[host.Name]types.NamespacedName,
+	waypointServiceKeys sets.Set[string],
 ) []VirtualHostWrapper {
 	meshGateway := sets.New(constants.IstioMeshGateway)
 	opts := RouteOptions{
@@ -259,6 +263,23 @@ func buildSidecarVirtualHostsForVirtualService(
 	}
 
 	hosts, matchingRegistryServices := separateVSHostsAndServices(virtualService, serviceRegistry, mostSpecificWildcardVsIndex)
+
+	// Service-level VirtualService routing for waypoint-bound services is
+	// handled by the waypoint.  Remove concrete services from the
+	// VirtualService-backed wrapper so they remain in serviceRegistry and get
+	// an ordinary default route later. Filtering after wildcard expansion
+	// preserves the policy for direct services selected by the same wildcard.
+	// Headless/no-VIP services cannot be reliably identified as
+	// service-addressed traffic and retain normal sidecar processing.
+	matchingRegistryServices = slices.FilterInPlace(matchingRegistryServices, func(svc *model.Service) bool {
+		if svc.GetAddressForProxy(node) == constants.UnspecifiedIP {
+			return true
+		}
+		return !waypointServiceKeys.Contains(svc.Key())
+	})
+	if len(hosts) == 0 && len(matchingRegistryServices) == 0 {
+		return nil
+	}
 
 	// Gateway allows only routes from the namespace of the proxy, or namespace of the destination.
 	if model.UseGatewaySemantics(virtualService) {

@@ -24,6 +24,7 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/util/hash"
+	"istio.io/istio/pkg/util/sets"
 )
 
 var (
@@ -56,6 +57,11 @@ type Cache struct {
 	DelegateVirtualServices []model.ConfigHash
 	DestinationRules        []*model.ConsolidatedDestRule
 	EnvoyFilterKeys         []string
+	// WaypointServiceKeys affects whether a concrete service receives
+	// VirtualService routes or a default route. It must be part of the cache
+	// key so waypoint binding changes cannot reuse a route configuration
+	// generated for the opposite ownership state.
+	WaypointServiceKeys sets.Set[string]
 }
 
 func (r *Cache) Type() string {
@@ -146,6 +152,8 @@ func (r *Cache) Key() any {
 		h.WriteString(string(svc.Hostname))
 		h.Write(Slash)
 		h.WriteString(svc.Attributes.Namespace)
+		h.Write(Slash)
+		h.WriteString(strconv.FormatBool(r.WaypointServiceKeys.Contains(svc.Key())))
 		h.Write(Separator)
 		for _, alias := range svc.Attributes.Aliases {
 			h.WriteString(string(alias.Hostname))
